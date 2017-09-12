@@ -1,16 +1,11 @@
 rancher-etcd
 ========
 
-A microservice that does micro things.
+Etcd image used in Kubernetes catalog
 
 ## Building
 
 `make`
-
-
-## Running
-
-`./bin/rancher-etcd`
 
 ## License
 Copyright (c) 2014-2016 [Rancher Labs, Inc.](http://rancher.com)

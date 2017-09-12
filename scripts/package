@@ -12,9 +12,9 @@ cd $(dirname $0)/../package
 TAG=${TAG:-${VERSION}${SUFFIX}}
 REPO=${REPO:-rancher}
 
-cp ../bin/rancher-etcd .
+cp ../bin/etcdwrapper .
 
-IMAGE=${REPO}/rancher-etcd:${TAG}
+IMAGE=${REPO}/etcd:${TAG}
 docker build -t ${IMAGE} .
 echo ${IMAGE} > ../dist/images
 echo Built ${IMAGE}
