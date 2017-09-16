@@ -78,6 +78,15 @@ healthcheck_proxy() {
     etcdwrapper healthcheck-proxy --port=:2378 --wait=$WAIT --debug=false
 }
 
+record_member_id() {
+  MEMBER_ID=$(etcdctl_quorum member list | grep "$NAME" | cut -d":" -f1)
+  while [ "$MEMBER_ID" == "" ]; do
+    sleep 10
+    MEMBER_ID=$(etcdctl_quorum member list | grep "$NAME" | cut -d":" -f1)
+  done
+  echo $MEMBER_ID > $ETCD_DATA_DIR/id
+}
+
 cleanup() {
     exitcode=$1
     timestamp=$(date -R)
@@ -108,6 +117,7 @@ standalone_node() {
     echo $IP > $ETCD_DATA_DIR/ip
 
     healthcheck_proxy 0s &
+    record_member_id &
     etcd $@ \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
@@ -121,6 +131,7 @@ standalone_node() {
 
 restart_node() {
     healthcheck_proxy &
+    record_member_id &
     etcd \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
@@ -173,6 +184,7 @@ runtime_node() {
     echo $IP > $ETCD_DATA_DIR/ip
 
     healthcheck_proxy &
+    record_member_id &
     etcd \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
@@ -213,6 +225,7 @@ recover_node() {
     echo $IP > $ETCD_DATA_DIR/ip
 
     healthcheck_proxy &
+    record_member_id &
     etcd \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
@@ -261,9 +274,20 @@ node() {
             ETCDCTL_API=3 etcdctl migrate --data-dir=$ETCD_DATA_DIR
         fi
 
-        echo Restarting Existing Node
-        restart_node
-
+        # check if its stale volume
+        MEMBER_ID=$(etcdctl_one member list | grep "$NAME" | cut -d":" -f1)
+        if [ "$MEMBER_ID" ]; then
+          if [ "$(cat $ETCD_DATA_DIR/id)" == "$MEMBER_ID" ]; then
+            echo Restarting Existing Node
+            restart_node
+          else
+            echo Recovering existing node data directory
+            recover_node
+          fi
+        else
+          echo Restarting Existing Node
+          restart_node
+        fi
     # if this member is already registered to the cluster but no data volume, we are recovering
     elif [ "$(etcdctl_one member list | grep $NAME)" ]; then
         echo Recovering existing node data directory
