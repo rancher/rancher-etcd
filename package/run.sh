@@ -1,8 +1,7 @@
 #!/bin/bash
 if [ "$RANCHER_DEBUG" == "true" ]; then set -x; fi
 
-MD=${RANCHER_METADATA_IP:-169.254.169.250}
-META_URL="http://${MD}/2015-12-19"
+META_URL="http://169.254.169.250/2015-12-19"
 
 # loop until metadata wakes up...
 STACK_NAME=$(wget -q -O - ${META_URL}/self/stack/name)
@@ -18,23 +17,19 @@ while [ ! "$(echo $IP | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}
     IP=$(wget -q -O - ${META_URL}/self/container/primary_ip)
 done
 
-while [ ! "$(echo $SERVICE_INDEX | grep -E '^[0-9]+$')" ]; do
-    sleep 1
-    SERVICE_INDEX=$(wget -q -O - ${META_URL}/self/container/service_index)
-done
-
 CREATE_INDEX=$(wget -q -O - ${META_URL}/self/container/create_index)
+SERVICE_INDEX=$(wget -q -O - ${META_URL}/self/container/service_index)
 HOST_UUID=$(wget -q -O - ${META_URL}/self/host/uuid)
 
 # be very careful that all state goes into the data container
-DATA_DIR=/data
-DR_FLAG=$DATA_DIR/disaster
-export ETCD_DATA_DIR=$DATA_DIR/etcd
+LEGACY_DATA_DIR=/data
+DATA_DIR=/pdata
+DR_FLAG=$DATA_DIR/DR
+export ETCD_DATA_DIR=$DATA_DIR/data.current
 export ETCDCTL_ENDPOINT=http://etcd.${STACK_NAME}:2379
-export ETCDCTL_API=2
 
 # member name should be dashed-IP (piggyback off of retain_ip functionality)
-NAME="etcd-$SERVICE_INDEX"
+NAME=$(echo $IP | tr '.' '-')
 
 etcdctl_quorum() {
     target_ip=0
@@ -78,13 +73,32 @@ healthcheck_proxy() {
     etcdwrapper healthcheck-proxy --port=:2378 --wait=$WAIT --debug=false
 }
 
-record_member_id() {
-  MEMBER_ID=$(etcdctl_quorum member list | grep "$NAME" | cut -d":" -f1)
-  while [ "$MEMBER_ID" == "" ]; do
-    sleep 10
-    MEMBER_ID=$(etcdctl_quorum member list | grep "$NAME" | cut -d":" -f1)
-  done
-  echo $MEMBER_ID > $ETCD_DATA_DIR/id
+create_backup() {
+    backup_type=$1
+    target_dir=$2
+
+    backup_dir=${DATA_DIR}/data.$(date +"%Y%m%d.%H%M%S").${backup_type}
+
+    etcdctl backup \
+        --data-dir $target_dir \
+        --backup-dir $backup_dir
+
+    echo $backup_dir
+}
+
+rolling_backup() {
+    EMBEDDED_BACKUPS=${EMBEDDED_BACKUPS:-true}
+
+    if [ "$EMBEDDED_BACKUPS" == "true" ]; then
+        BACKUP_PERIOD=${BACKUP_PERIOD:-5m}
+        BACKUP_RETENTION=${BACKUP_RETENTION:-24h}
+
+        giddyup leader elect --proxy-tcp-port=2160 \
+            etcdwrapper rolling-backup \
+                --period=$BACKUP_PERIOD \
+                --retention=$BACKUP_RETENTION \
+                --index=$SERVICE_INDEX
+    fi
 }
 
 cleanup() {
@@ -100,9 +114,6 @@ cleanup() {
         rm -rf $ETCD_DATA_DIR
         echo "$timestamp -> Exit (2), log corrupted, truncated, lost. Deleted data" >> $DATA_DIR/events
 
-    elif [ "$exitcode" == "143" ]; then
-        echo "$timestamp -> Exit (143), likely received SIGTERM. No action taken" >> $DATA_DIR/events
-
     else
         echo "$timestamp -> Exit ($exitcode), unknown. No action taken" >> $DATA_DIR/events
     fi
@@ -117,8 +128,8 @@ standalone_node() {
     echo $IP > $ETCD_DATA_DIR/ip
 
     healthcheck_proxy 0s &
-    record_member_id &
-    etcd $@ \
+    rolling_backup &
+    etcd \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
         --advertise-client-urls http://${IP}:2379 \
@@ -131,7 +142,7 @@ standalone_node() {
 
 restart_node() {
     healthcheck_proxy &
-    record_member_id &
+    rolling_backup &
     etcd \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
@@ -171,7 +182,7 @@ runtime_node() {
         fi
 
         cip=$(wget -q -O - ${META_URL}/self/service/containers/${container}/primary_ip)
-        cname="etcd-$(wget -q -O - ${META_URL}/self/service/containers/${container}/service_index)"
+        cname=$(echo $cip | tr '.' '-')
         if [ "$cluster" != "" ]; then
             cluster=${cluster},
         fi
@@ -184,7 +195,7 @@ runtime_node() {
     echo $IP > $ETCD_DATA_DIR/ip
 
     healthcheck_proxy &
-    record_member_id &
+    rolling_backup &
     etcd \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
@@ -203,7 +214,7 @@ recover_node() {
     echo "$timestamp -> Recovering. Deleted stale data" >> $DATA_DIR/events
 
     # figure out which node we are replacing
-    oldnode=$(etcdctl_quorum member list | grep "$NAME" | tr ':' '\n' | head -1 | sed 's/\[unstarted\]//')
+    oldnode=$(etcdctl_quorum member list | grep "$IP" | tr ':' '\n' | head -1 | sed 's/\[unstarted\]//')
 
     # remove the old node
     etcdctl_quorum member remove $oldnode
@@ -225,7 +236,7 @@ recover_node() {
     echo $IP > $ETCD_DATA_DIR/ip
 
     healthcheck_proxy &
-    record_member_id &
+    rolling_backup &
     etcd \
         --name ${NAME} \
         --listen-client-urls http://0.0.0.0:2379 \
@@ -238,77 +249,98 @@ recover_node() {
 }
 
 disaster_node() {
-    local skip_hash_check
-    skip_hash_check="${1:-false}"
+    RECOVERY_DIR=${DATA_DIR}/$(cat $DR_FLAG)
 
-    rm -rf $ETCD_DATA_DIR
-    ETCDCTL_API=3 etcdctl snapshot restore $DATA_DIR/snapshot \
-        --name=${NAME} \
-        --data-dir=$ETCD_DATA_DIR \
-        --initial-advertise-peer-urls=http://${IP}:2380 \
-        --initial-cluster="$NAME=http://${IP}:2380" \
-        --skip-hash-check="$skip_hash_check"
-
-    if [ $? -ne 0 ]; then
-        echo Error restoring snapshot! Aborting.
-        exit 1
+    # always backup the current dir
+    if [ "$RECOVERY_DIR" == "${DATA_DIR}/data.current" ]; then
+        RECOVERY_DIR=$(create_backup DR $RECOVERY_DIR)
     fi
 
+    echo "Sanitizing backup..."
+    etcd \
+        --name ${NAME} \
+        --data-dir $RECOVERY_DIR \
+        --force-new-cluster &
+    PID=$!
+
+    # wait until etcd reports healthy
+    giddyup probe http://127.0.0.1:2379/health --loop --min 1s --max 15s --backoff 1.2
+
+    # Disaster recovery ignores peer-urls flag, so we update it
+
+    # query etcd for its old member ID
+    while [ "$oldnode" == "" ]; do
+        oldnode=$(etcdctl --endpoints=http://127.0.0.1:2379 member list | grep "$NAME" | tr ':' '\n' | head -1)
+        sleep 1
+    done
+
+    # etcd says it is healthy, but writes fail for a while...so keep trying until it works
+    etcdctl --endpoints=http://127.0.0.1:2379 member update $oldnode http://${IP}:2380
+    while [ "$?" != "0" ]; do
+        sleep 1
+        etcdctl --endpoints=http://127.0.0.1:2379 member update $oldnode http://${IP}:2380
+    done
+
+    # shutdown the node cleanly
+    while kill -0 $PID &> /dev/null; do
+        kill $PID
+        sleep 1
+    done
+
+    echo "Copying sanitized backup to data directory..."
+    mkdir -p ${ETCD_DATA_DIR}
+    rm -rf ${ETCD_DATA_DIR}/*
+    cp -rf $RECOVERY_DIR/* ${ETCD_DATA_DIR}/
+
+    # remove the DR flag
     rm -rf $DR_FLAG
-    standalone_node --force-new-cluster
+
+    # TODO (llparse) kill all other etcd nodes
+
+    # become a new standalone node
+    standalone_node
 }
 
 node() {
     mkdir -p $ETCD_DATA_DIR
 
+    if [ -d "$LEGACY_DATA_DIR/member" ] && [ ! -d "$LEGACY_DATA_DIR/data.current" ]; then
+        echo "Upgrading FS structure from version <= etcd:v2.3.6-4 to etcd:v2.3.7-6"
+        mkdir -p $LEGACY_DATA_DIR/data.current
+        rm -rf $LEGACY_DATA_DIR/data.current/*
+        cp -rf $LEGACY_DATA_DIR/member $LEGACY_DATA_DIR/data.current/
+        node
+
+    elif [ -d "$LEGACY_DATA_DIR/data.current" ] && [ ! -d "$ETCD_DATA_DIR/member" ]; then
+        echo "Upgrading FS structure from version = rancher/etcd:v2.3.7-6 to current"
+        mkdir -p $ETCD_DATA_DIR
+        rm -rf $ETCD_DATA_DIR/*
+        cp -rf $LEGACY_DATA_DIR/data.current/member $ETCD_DATA_DIR/
+        echo $IP > $ETCD_DATA_DIR/ip
+        node
+
     # if the DR flag is set, enter disaster recovery
-    if [ -f "$DR_FLAG" ]; then
+    elif [ -f "$DR_FLAG" ]; then
         echo Disaster Recovery
         disaster_node
 
     # if we have a data volume and it was served by a container with same IP
     elif [ -d "$ETCD_DATA_DIR/member" ] && [ "$(cat $ETCD_DATA_DIR/ip)" == "$IP" ]; then
+        echo Restarting Existing Node
+        restart_node
 
-        # if the migration flag is set, upgrade to v3
-        if [ "$ETCD_MIGRATE" == "v3" ]; then
-            ETCDCTL_API=3 etcdctl migrate --data-dir=$ETCD_DATA_DIR
-        fi
-
-        # check if its stale volume
-        MEMBER_ID=$(etcdctl_one member list | grep "$NAME" | cut -d":" -f1)
-        if [ "$MEMBER_ID" ]; then
-          if [ "$(cat $ETCD_DATA_DIR/id)" == "$MEMBER_ID" ]; then
-            echo Restarting Existing Node
-            restart_node
-          else
-            echo Recovering existing node data directory
-            recover_node
-          fi
-        else
-          echo Restarting Existing Node
-          restart_node
-        fi
     # if this member is already registered to the cluster but no data volume, we are recovering
-    elif [ "$(etcdctl_one member list | grep $NAME)" ]; then
+    elif [ "$(etcdctl_one member list | grep $IP)" ]; then
         echo Recovering existing node data directory
         recover_node
 
     # if we are the first etcd to start
     elif giddyup leader check; then
 
-        # if we have a backup dir with at one or more snapshots, trigger an autormatic disaster recovery
-        if [ -d "/backup" ] && [ "$(ls /backup | wc -l)" != "0" ]; then
-            echo Found a backup. Attempting Disaster Recovery
-            cp "/backup/$(ls /backup | tail -1)" $DATA_DIR/snapshot
-            touch $DR_FLAG
-            disaster_node true
-
-        # if we have an old data dir, trigger an automatic disaster recovery
-        elif [ -f "$ETCD_DATA_DIR/member/snap/db" ]; then
-            echo Found old cluster data. Attempting Disaster Recovery
-            cp $ETCD_DATA_DIR/member/snap/db $DATA_DIR/snapshot
-            touch $DR_FLAG
-            disaster_node true
+        # if we have an old data dir, trigger an automatic disaster recovery (tee-hee)
+        if [ -d "$ETCD_DATA_DIR/member" ]; then
+            echo data.current > $DR_FLAG
+            disaster_node
 
         # otherwise, start a new cluster
         else

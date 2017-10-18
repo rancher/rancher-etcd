@@ -8,25 +8,17 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/rancher/go-rancher-metadata/metadata"
 	"github.com/urfave/cli"
 )
 
 const (
-	dataDir       = "/data/etcd"
-	backupBaseDir = "/backup"
+	dataDir       = "/pdata/data.current"
+	backupBaseDir = "/data-backup"
 	backupRetries = 4
-	metadataURL   = "http://169.254.169.250/2016-07-29"
-)
-
-var (
-	mClient   metadata.Client
-	stackName string
 )
 
 func init() {
@@ -34,19 +26,6 @@ func init() {
 }
 
 func main() {
-	err := os.Setenv("ETCDCTL_API", "3")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// initializing Rancher metadata client
-	mClient = metadata.NewClient(metadataURL)
-	selfStack, err := mClient.GetSelfStack()
-	if err != nil {
-		log.Fatal(err)
-	}
-	stackName = selfStack.Name
-
 	app := cli.NewApp()
 	app.Name = "Etcd Wrapper"
 	app.Usage = "Utility services for Etcd clusters"
@@ -95,14 +74,19 @@ func RollingBackupCommand() cli.Command {
 		Action: RollingBackupAction,
 		Flags: []cli.Flag{
 			cli.DurationFlag{
-				Name:  "creation",
-				Usage: "Create backups after this time interval",
+				Name:  "period",
+				Usage: "Perform backups at this time interval",
 				Value: 5 * time.Minute,
 			},
 			cli.DurationFlag{
 				Name:  "retention",
-				Usage: "Retain backups within this time interval",
+				Usage: "Retain backups for this time interval",
 				Value: 24 * time.Hour,
+			},
+			cli.IntFlag{
+				Name:  "index",
+				Usage: "Etcd container service index",
+				Value: 0,
 			},
 			cli.BoolFlag{
 				Name:   "debug",
@@ -147,31 +131,30 @@ func ProxyAction(c *cli.Context) error {
 func RollingBackupAction(c *cli.Context) error {
 	SetLoggingLevel(c.Bool("debug"))
 
-	creationPeriod := c.Duration("creation")
+	backupPeriod := c.Duration("period")
 	retentionPeriod := c.Duration("retention")
+	index := c.Int("index")
 
 	log.WithFields(log.Fields{
-		"creation":  creationPeriod,
+		"period":    backupPeriod,
 		"retention": retentionPeriod,
 	}).Info("Initializing Rolling Backups")
 
-	backupTicker := time.NewTicker(creationPeriod)
+	backupTicker := time.NewTicker(backupPeriod)
 	for {
 		select {
 		case backupTime := <-backupTicker.C:
-			CreateBackup(backupTime)
+			CreateBackup(backupTime, index)
 			DeleteBackups(backupTime, retentionPeriod)
 		}
 	}
 }
 
-func CreateBackup(t time.Time) {
+func CreateBackup(t time.Time, index int) {
 	var err error
-	var selectedContIP string
-	var clusterHealthy bool
-	var raftIndex int
 	failureInterval := 15 * time.Second
-	backupName := fmt.Sprintf("%s_etcd", t.Format(time.RFC3339))
+	backupName := fmt.Sprintf("%s_etcd_%d", t.Format(time.RFC3339), index)
+	tempDir := fmt.Sprintf("/tmp/%s", backupName)
 	backupDir := fmt.Sprintf("%s/%s", backupBaseDir, backupName)
 
 	for retries := 0; retries <= backupRetries; retries++ {
@@ -179,72 +162,38 @@ func CreateBackup(t time.Time) {
 			time.Sleep(failureInterval)
 		}
 
-		etcdContainers, err := mClient.GetServiceContainers("etcd", stackName)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"attempt": retries + 1,
-				"error":   err,
-				"data":    "",
-			}).Warn("Backup failed - Can't connect to metadata")
-			continue
-		}
-
-		raftIndex = 0
-		selectedContIP = "0"
-		clusterHealthy = false
-		for _, etcdContainer := range etcdContainers {
-			// check if the cluster is healthy
-			cmd := exec.Command("etcdctl", "--endpoints", etcdContainer.PrimaryIp+":2379", "endpoint", "health")
-			data, _ := cmd.CombinedOutput()
-
-			if strings.Contains(string(data), "unhealthy") {
-				log.WithFields(log.Fields{
-					"error": err,
-					"data":  string(data),
-				}).Warn("Checking member health failed from etcd member: " + etcdContainer.PrimaryIp)
-				continue
-			} else {
-				// member is healthy, checking for raft index
-				cmd := exec.Command("etcdctl", "--endpoints", etcdContainer.PrimaryIp+":2379", "endpoint", "status")
-				data, _ := cmd.CombinedOutput()
-				endpointStatus := strings.Split(string(data), ", ")
-				endpointRI := strings.TrimSuffix(endpointStatus[len(endpointStatus)-1], "\n")
-				currentRI, _ := strconv.Atoi(endpointRI)
-				if currentRI >= raftIndex {
-					raftIndex = currentRI
-					selectedContIP = etcdContainer.PrimaryIp
-					clusterHealthy = true
-				}
-			}
-		}
-		if !clusterHealthy {
-			log.WithFields(log.Fields{
-				"attempt": retries + 1,
-			}).Warn("Backup failed - Cluster is unhealthy")
-			continue
-		}
-
-		cmd := exec.Command("etcdctl", "snapshot", "save", "--endpoints", selectedContIP+":2379", backupDir)
+		// write to a temporary location because etcd v2.3.7 doesn't play nice with NFS v4
+		// https://github.com/coreos/etcd/issues/5537
+		cmd := exec.Command("etcdctl", "backup", "--data-dir", dataDir, "--backup-dir", tempDir)
 
 		startTime := time.Now()
-		data, err := cmd.CombinedOutput()
+		err = cmd.Run()
 		endTime := time.Now()
 
 		if err != nil {
 			log.WithFields(log.Fields{
 				"attempt": retries + 1,
 				"error":   err,
-				"data":    string(data),
 			}).Warn("Backup failed")
 
 		} else {
-			log.WithFields(log.Fields{
-				"name":      backupName,
-				"runtime":   endTime.Sub(startTime),
-				"member":    selectedContIP,
-				"raftIndex": raftIndex,
-			}).Info("Created backup")
-			break
+			// move backup from temp location
+			cmd = exec.Command("mv", tempDir, backupDir)
+			err = cmd.Run()
+
+			if err != nil {
+				log.WithFields(log.Fields{
+					"attempt": retries + 1,
+					"error":   err,
+				}).Warn("Moving backup failed")
+
+			} else {
+				log.WithFields(log.Fields{
+					"name":    backupName,
+					"runtime": endTime.Sub(startTime),
+				}).Info("Created backup")
+				break
+			}
 		}
 	}
 
@@ -267,10 +216,10 @@ func DeleteBackups(backupTime time.Time, retentionPeriod time.Duration) {
 	cutoffTime := backupTime.Add(retentionPeriod * -1)
 
 	for _, file := range files {
-		if file.IsDir() {
+		if !file.IsDir() {
 			log.WithFields(log.Fields{
 				"name": file.Name(),
-			}).Warn("Ignored directory, expecting file")
+			}).Warn("Ignored non-directory")
 			continue
 		}
 
@@ -310,7 +259,7 @@ func DeleteBackup(file os.FileInfo) {
 	}
 }
 
-// HealthCheck function TODO (llparse): inherit this function from giddyup
+// HealthCheck TODO (llparse): inherit this function from giddyup
 func HealthCheck(endpoint string, timeout time.Duration) error {
 	url, err := url.Parse(endpoint)
 	if err != nil {
@@ -337,10 +286,10 @@ func HealthCheck(endpoint string, timeout time.Duration) error {
 		case resp.StatusCode >= 200 && resp.StatusCode <= 299:
 			return nil
 		default:
-			return fmt.Errorf("error: HTTP %d", resp.StatusCode)
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 	default:
-		return fmt.Errorf("error: Unsupported URL scheme: %s", url.Scheme)
+		return fmt.Errorf("Unsupported URL scheme: %s", url.Scheme)
 	}
 	return nil
 }
