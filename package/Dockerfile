@@ -4,7 +4,7 @@ WORKDIR /opt/rancher
 ENV PATH $PATH:/opt/rancher
 
 RUN \
-  apt-get update && apt-get install -y ca-certificates wget && \
+  apt-get update && apt-get install -y ca-certificates wget curl unzip bc && \
   apt-get clean && \
   wget -q -O /opt/rancher/giddyup https://github.com/rancher/giddyup/releases/download/v0.18.0/giddyup && \
   chmod +x /opt/rancher/giddyup
