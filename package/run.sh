@@ -373,6 +373,12 @@ disaster_node() {
     etcd \
         --name ${NAME} \
         --data-dir $RECOVERY_DIR \
+        --advertise-client-urls https://${ETCD_CONTAINER_NAME}:2379 \
+        --listen-client-urls https://0.0.0.0:2379 \
+        --client-cert-auth \
+        --trusted-ca-file $ETCD_CA_FILE \
+        --key-file $ETCD_KEY_FILE \
+        --cert-file $ETCD_CERT_FILE \
         --force-new-cluster &
     PID=$!
 
