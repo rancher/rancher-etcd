@@ -10,17 +10,18 @@ while [ "$STACK_NAME" == "" ]; do
   STACK_NAME=$(wget -q -O - ${META_URL}/self/stack/name)
 done
 # Get etcd service certificates
-UUID=$(curl -s http://rancher-metadata/2015-12-19/stacks/Kubernetes/services/etcd/uuid)
-ACTION=$(curl -s -u $CATTLE_ACCESS_KEY:$CATTLE_SECRET_KEY "$CATTLE_URL/services?uuid=$UUID" | jq -r '.data[0].actions.certificate')
 
-if [ -n "$ACTION" ]; then
-    mkdir -p /etc/etcd/ssl
-    cd /etc/etcd/ssl
-    curl -s -u $CATTLE_ACCESS_KEY:$CATTLE_SECRET_KEY -X POST $ACTION > certs.zip
-    unzip -o certs.zip
-    cd $OLDPWD
-
-fi
+mkdir -p /etc/etcd/ssl
+cd /etc/etcd/ssl
+while  [ -z "$ACTION" ] || [ "$ACTION" == "null" ]
+do
+    sleep 1
+    UUID=$(curl -s http://rancher-metadata/2015-12-19/stacks/Kubernetes/services/etcd/uuid)
+    ACTION=$(curl -s -u $CATTLE_ACCESS_KEY:$CATTLE_SECRET_KEY "$CATTLE_URL/services?uuid=$UUID" | jq -r '.data[0].actions.certificate')
+done
+curl -s -u $CATTLE_ACCESS_KEY:$CATTLE_SECRET_KEY -X POST $ACTION > certs.zip
+unzip -o certs.zip
+cd $OLDPWD
 
 export ETCD_CA_FILE="/etc/etcd/ssl/ca.pem"
 export ETCD_KEY_FILE="/etc/etcd/ssl/key.pem"
@@ -60,6 +61,8 @@ probe_https() {
   min=${3:-1}
   max=${4:-15}
   backoff=${5:-1}
+  # start a time counter
+  SECONDS=0
 
   delay=$min
   if [ $loop == "loop" ]
@@ -79,6 +82,12 @@ probe_https() {
       if [ $? -eq 0 ]
       then
         return 0
+      fi
+      # check the time counter, how long have we been trying!
+      [ "$RANCHER_DEBUG" == "true" ] && echo "seconds=" $SECONDS
+      if [ $SECONDS -gt 60 ]
+      then
+        return $SECONDS
       fi
       sleep $delay
     done
@@ -264,6 +273,11 @@ runtime_node() {
         primary_ip=$(wget -q -O - ${META_URL}/self/service/containers/${container}/primary_ip)
         if [ "${ctx_index}" -lt "${CREATE_INDEX}" ]; then
             probe_https https://${container}:2379/health loop 1 15 1.2
+            if [ $? -ne 0 ]
+            then
+              echo "Failed to get a healthy response. Giving up.."
+              exit 1
+            fi
         fi
     done
 
