@@ -104,7 +104,7 @@ switch_node_to_https() {
   member_id=""
   while [ "$member_id" == "" ]
   do
-    member_id=$(etcdctl_one member list | grep $NAME | cut -d ":" -f 1)
+    member_id=$(etcdctl --endpoints=https://127.0.0.1:2379 member list | grep $NAME | cut -d ":" -f 1)
     sleep 1
   done
   # etcd says it is healthy, but writes fail for a while...so keep trying until it works
