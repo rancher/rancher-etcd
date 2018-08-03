@@ -1,6 +1,8 @@
 #!/bin/bash
 if [ "$RANCHER_DEBUG" == "true" ]; then set -x; fi
 
+update-rancher-ssl
+
 META_URL="http://169.254.169.250/2015-12-19"
 
 # loop until metadata wakes up...
@@ -9,14 +11,14 @@ while [ "$STACK_NAME" == "" ]; do
   sleep 1
   STACK_NAME=$(wget -q -O - ${META_URL}/self/stack/name)
 done
-# Get etcd service certificates
 
+# Get etcd service certificates
 mkdir -p /etc/etcd/ssl
 cd /etc/etcd/ssl
 while  [ -z "$ACTION" ] || [ "$ACTION" == "null" ]
 do
     sleep 1
-    UUID=$(curl -s http://rancher-metadata/2015-12-19/stacks/Kubernetes/services/etcd/uuid)
+    UUID=$(curl -s ${META_URL}/stacks/Kubernetes/services/etcd/uuid)
     ACTION=$(curl -s -u $CATTLE_ACCESS_KEY:$CATTLE_SECRET_KEY "$CATTLE_URL/services?uuid=$UUID" | jq -r '.data[0].actions.certificate')
 done
 curl -s -u $CATTLE_ACCESS_KEY:$CATTLE_SECRET_KEY -X POST $ACTION > certs.zip
@@ -35,7 +37,7 @@ SCALE=$(giddyup service scale etcd)
 while [ ! "$(echo $IP | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')" ]; do
     sleep 1
     IP=$(wget -q -O - ${META_URL}/self/container/primary_ip)
-    ETCD_CONTAINER_NAME=$(curl -s http://rancher-metadata/2015-12-19/self/container/name)
+    ETCD_CONTAINER_NAME=$(curl -s ${META_URL}/self/container/name)
 done
 
 CREATE_INDEX=$(wget -q -O - ${META_URL}/self/container/create_index)
